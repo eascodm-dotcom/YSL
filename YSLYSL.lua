@@ -2,16 +2,22 @@
     YSL FINAL SHOWDOWN
     discord.gg/yslrolling
 
-    UI: Obsidian. Forward decls FIXED - all toggles functional.
+    UI: Obsidian.
+    Fixes:
+    - Weave Glide: no more continuous movement.
+    - Config save/load via JSON.
+    - Sensitivity slider 1-200 (100 = neutral).
 ]]
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
 local Lighting          = game:GetService("Lighting")
+local HttpService       = game:GetService("HttpService")
 local LP = Players.LocalPlayer
 
--- =========================== FORWARD DECLS (must be before UI) ==============
+-- =========================== FORWARD DECLS =================================
 local CounterEnabled  = false
 local CounterReturn   = true
 local CounterClear    = true
@@ -25,8 +31,11 @@ local StretchToggle
 local SetStretchAspect
 local autoWeaveStart
 local autoWeaveStop
+local SaveConfig
+local LoadConfig
+local ApplySensitivity
 
--- =========================== LOAD OBSIDIAN ==================================
+-- =========================== LOAD OBSIDIAN =================================
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"))()
 
 -- =========================== CONFIG ========================================
@@ -48,6 +57,7 @@ local Config = {
         walkSpeed = { enabled = false, value = 16 },
         heavyBoost = false,
     },
+    input = { sensitivity = 100 },
     dodge = { noStun = true, hitThrough = true },
     longRange = { enabled = false, mode = "position", maxRadius = 15 },
     damageNumbers = true, damageSwingWindow = 0.55,
@@ -60,6 +70,39 @@ local Config = {
 }
 
 local STATS = { hits=0, silentHits=0, counterHits=0, dodgeRetries=0 }
+
+-- =========================== CONFIG SAVE/LOAD ==============================
+SaveConfig = function()
+    if not writefile or not isfolder then return false end
+    local ok = pcall(function()
+        if not isfolder("YSL") then makefolder("YSL") end
+        writefile("YSL/config.json", HttpService:JSONEncode(Config))
+    end)
+    return ok
+end
+
+LoadConfig = function()
+    if not (isfile and readfile and isfolder) then return false end
+    if not isfolder("YSL") or not isfile("YSL/config.json") then return false end
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile("YSL/config.json")) end)
+    if not ok or type(data) ~= "table" then return false end
+    for k, v in pairs(data) do
+        if type(v) == "table" and type(Config[k]) == "table" then
+            for k2, v2 in pairs(v) do Config[k][k2] = v2 end
+        else
+            Config[k] = v
+        end
+    end
+    return true
+end
+
+LoadConfig()
+
+-- =========================== SENSITIVITY ===================================
+ApplySensitivity = function(v)
+    -- slider 1-200, mapped so 100 = 1.0x default
+    pcall(function() UserInputService.MouseDeltaSensitivity = v / 100 end)
+end
 
 -- =========================== WINDOW ========================================
 local Window = Library:CreateWindow({
@@ -202,6 +245,43 @@ DN:AddToggle("dmgNums", { Text = "Damage Numbers", Default = Config.damageNumber
 DN:AddSlider("swingWindow", { Text = "Swing Window", Default = Config.damageSwingWindow,
     Min = 0.10, Max = 1.50, Rounding = 2, Suffix = "s",
     Callback = function(v) Config.damageSwingWindow = v end })
+
+local SENS = Tabs.Misc:AddLeftGroupbox("Input")
+SENS:AddSlider("sens_slider", { Text = "Look Sensitivity", Default = Config.input.sensitivity,
+    Min = 1, Max = 200, Rounding = 0,
+    Callback = function(v) Config.input.sensitivity = v; ApplySensitivity(v) end })
+ApplySensitivity(Config.input.sensitivity)
+
+local CFG = Tabs.Misc:AddRightGroupbox("Config")
+CFG:AddButton({ Text = "Save Config", Func = function()
+    if SaveConfig() then
+        Library:Notify("Config saved to YSL/config.json", 4)
+    else
+        Library:Notify("Save failed (executor no file access?)", 4)
+    end
+end })
+CFG:AddButton({ Text = "Load Config", Func = function()
+    if LoadConfig() then
+        Library:Notify("Config loaded. Some values apply on respawn.", 4)
+    else
+        Library:Notify("Load failed — no saved config found", 4)
+    end
+end })
+CFG:AddButton({ Text = "Reset Config", Func = function()
+    Config.autoWeave.enabled = false
+    Config.autoWeave.manualOnly = true
+    Config.autoWeave.hold = 0.22
+    Config.hitbox.enabled = false
+    Config.hitbox.radius = 7
+    Config.damage.hitMultiplier.enabled = false
+    Config.damage.hitMultiplier.value = 1
+    Config.damage.hitMultiplier.delay = 0.08
+    Config.movement.glide.enabled = false
+    Config.movement.glide.speed = 16
+    Config.input.sensitivity = 100
+    ApplySensitivity(100)
+    Library:Notify("Config reset (toggles above unchanged until reload)", 4)
+end })
 
 -- =========================== FEATURE CODE ==================================
 local featureOk, featureErr = pcall(function()
@@ -502,7 +582,7 @@ local function hookCombat()
     end
 end
 
--- Glide
+-- Glide (fixed)
 local glideBody = Instance.new("BodyVelocity")
 glideBody.Name = "YSLGlide"; glideBody.MaxForce = Vector3.new(100000,0,100000); glideBody.P = 8000; glideBody.Velocity = Vector3.zero
 local glideOn = false
@@ -511,14 +591,21 @@ local function stopGlide()
     glideOn = false; glideBody.Velocity = Vector3.zero; glideBody.Parent = nil
 end
 local function updateGlide(rp, hum)
-    if not Config.movement.glide.enabled or not rp or not hum or hum.Health <= 0 then stopGlide(); return end
-    local mv = hum.MoveDirection
-    if mv.Magnitude < 0.05 then
-        local lk = rp.CFrame.LookVector; mv = Vector3.new(lk.X,0,lk.Z)
+    if not Config.movement.glide.enabled or not rp or not hum or hum.Health <= 0 then
+        stopGlide(); return
     end
+    local isWeaving = Active.Weaving == true
+    if not isWeaving and CharacterController then
+        local ok, w = pcall(function() return CharacterController:Is("Weaving") end)
+        isWeaving = ok and w == true
+    end
+    if not isWeaving then stopGlide(); return end
+    local mv = hum.MoveDirection
     if mv.Magnitude < 0.05 then stopGlide(); return end
+    local horiz = Vector3.new(mv.X, 0, mv.Z)
+    if horiz.Magnitude < 0.05 then stopGlide(); return end
     if glideBody.Parent ~= rp then glideBody.Parent = rp end
-    glideBody.Velocity = mv.Unit * Config.movement.glide.speed
+    glideBody.Velocity = horiz.Unit * Config.movement.glide.speed
     glideOn = true
 end
 
