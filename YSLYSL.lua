@@ -3,9 +3,37 @@
     discord.gg/yslrolling
 
     UI: Obsidian.
-    v3: config persistence, weave-gated glide, cross-platform sensitivity,
-        Weave Combat (hit while weaving), Killaura, real damage numbers,
-        no stray part in the character, silent-hit count up to 10.
+    v31:
+      - auto-weave back to your original: awFire(false); awFire(true), wait hold,
+        wait gap, Heartbeat forcing CanAttack/OpenFrame. No bucket, no hold floor,
+        hold default 0.22, slider min 0.10.
+      - grey box kill from v30 stays.
+    v30:
+      - grey box identified: the game clones Assets.VFX.WeaveHighlight into a
+        character, renames it WeaveHIGHLIGHT and destroys it after 0.4s. The old
+        sweep only killed real Highlights and parts under Attachments, so a part
+        named WeaveHIGHLIGHT survived. Now killed by name, every 0.1s, on every
+        character.
+      - weave cadence limited by the game's own contract: CombatService.Weave is
+        10/s burst 10, so a 2-call cycle at 0.22s hold sat right on the ceiling.
+        Hold floor is now 0.25s plus a dedicated 8/s bucket.
+    v29:
+      - hits now use the exact wire shape RobloxSpy logged from the game:
+        HitReport:FireServer(seq, <hit part>, <world position of that part>).
+        Previously the script sent HumanoidRootPart + its position.
+      - scripted path (no HitWindow hook) fires Swing:FireServer(seq, "Attack",
+        <limb>) first, matching the server's swing-then-hit order.
+    v28:
+      - autoload no longer leaves the Auto-Weave toggle showing ON while the
+        feature is stopped (it now flips the toggle back to OFF).
+      - auto-weave says on screen when Combat.Weave is nil instead of idling silently.
+    v27:
+      - headless: replaced with ScriptBlox logic.
+        applyHeadless uses ch:WaitForChild("Head", math.random(6,11)) then
+        sets Head.Transparency = 1 and face.Transparency = 1.
+        restoreHead sets both back to 0 on toggle off.
+        CharacterAdded reapplies 0.33s after spawn when headless is on.
+      - everything else from v26 kept.
 ]]
 
 local Players           = game:GetService("Players")
@@ -21,11 +49,7 @@ local OBSIDIAN_URL = "https://raw.githubusercontent.com/deividcomsono/Obsidian/r
 local SAVE_ROOT    = "YSL/configs"
 local AUTOLOAD_FILE = "YSL/autoload.txt"
 
--- =========================== FORWARD DECLS (must be before UI) ==============
-local CounterEnabled  = false
-local CounterReturn   = true
-local CounterClear    = true
-local CounterAssert   = true
+-- =========================== FORWARD DECLS =================================
 local RebuildCrosshair
 local ApplyTransparency
 local HeadlessToggle
@@ -35,15 +59,42 @@ local StretchToggle
 local SetStretchAspect
 local autoWeaveStart
 local autoWeaveStop
-local WeaveHitSet
-local KillAuraSet
-local ApplySensitivity
 local ApplyAllConfig
 local RunDoctor
-local StartSpy
-local DumpSpy
 
--- =========================== LOAD OBSIDIAN ==================================
+-- =========================== SHOW ERROR (BEFORE OBSIDIAN) ==================
+showError = function(msg)
+    local text = tostring(msg)
+    if #text > 400 then text = string.sub(text, 1, 400) end
+    warn("[YSL] " .. text)
+    pcall(function()
+        local pg = game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not pg then return end
+        local old = pg:FindFirstChild("YSL_ERR")
+        if old then old:Destroy() end
+        local g = Instance.new("ScreenGui")
+        g.Name = "YSL_ERR"
+        g.ResetOnSpawn = false
+        g.DisplayOrder = 99999
+        g.Parent = pg
+        local l = Instance.new("TextLabel")
+        l.Size = UDim2.new(0.96, 0, 0.3, 0)
+        l.Position = UDim2.new(0.02, 0, 0.02, 0)
+        l.BackgroundColor3 = Color3.fromRGB(110, 0, 0)
+        l.BackgroundTransparency = 0.15
+        l.BorderSizePixel = 0
+        l.TextWrapped = true
+        l.Font = Enum.Font.Code
+        l.TextSize = 14
+        l.TextColor3 = Color3.fromRGB(255, 255, 255)
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.TextYAlignment = Enum.TextYAlignment.Top
+        l.Text = "YSL ERROR\n" .. text
+        l.Parent = g
+    end)
+end
+
+-- =========================== LOAD OBSIDIAN =================================
 local Library
 do
     local compile = loadstring or load
@@ -54,53 +105,110 @@ do
         return chunk()
     end)
     if not ok or type(res) ~= "table" then
-        warn("[YSL] failed to load Obsidian: " .. tostring(res))
+        showError("Obsidian failed to load: " .. tostring(res))
         return
     end
     Library = res
 end
 
+local function keepGuiAlive()
+    local targets = {}
+    pcall(function()
+        targets[#targets + 1] = game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    end)
+    pcall(function()
+        if gethui then targets[#targets + 1] = gethui() end
+    end)
+    for _, holder in ipairs(targets) do
+        if holder then
+            local ok, kids = pcall(function() return holder:GetChildren() end)
+            if ok and type(kids) == "table" then
+                for _, gui in ipairs(kids) do
+                    if gui:IsA("ScreenGui") then
+                        pcall(function() gui.ResetOnSpawn = false end)
+                    end
+                end
+            end
+        end
+    end
+end
+
 -- =========================== CONFIG ========================================
 local Config = {
-    autoWeave = { enabled = false, manualOnly = true, hold = 0.22, gap = 0.0 },
-    hitbox = { enabled = false, radius = 7, airOnly = false },
-    punchSpeed = { enabled = false, value = 1.7 },
-    stompSpeed = { enabled = false, value = 1.4 },
-    autoStomp = false,
-    styleChanger = { enabled = false, style = "Philly" },
+    autoWeave = { enabled = false, manualOnly = false, hold = 0.22, gap = 0.0 },
+    hitbox = { enabled = false, radius = 7, airOnly = false, groundOnly = false },
     damage = {
         autoConnect = false, connectRange = 15,
-        hitMultiplier = { enabled = false, value = 1, delay = 0.08 },
+        hitMultiplier = { enabled = false, value = 1, delay = 0.10 },
         noAttackDelay = false,
     },
     movement = {
         glide = { enabled = false, speed = 16 },
-        antiDebounce = { enabled = false, value = 0.2 },
         walkSpeed = { enabled = false, value = 16 },
-        heavyBoost = false,
     },
-    sensitivity = { enabled = false, value = 1.0 },
-    weaveHit = { enabled = false, window = 0.12, restoreDelay = 0.06, reassert = true },
-    killaura = { enabled = false, radius = 12, interval = 0.12, maxTargets = 1, weaveSync = true },
     dodge = { noStun = true, hitThrough = true },
-    counter = { enabled = false, returnFire = true, clearStun = true, assert = true },
     longRange = { enabled = false, mode = "position", maxRadius = 15 },
     damageNumbers = true, damageSwingWindow = 1.10,
-    comboReset = false, phoneSwitch = false, comboResetDelay = 0.03, comboDebounce = 0.35, comboIdleReset = 0.85,
+    noDelay = false,
     headless = false, philly = false, lowGraphics = false,
     stretchResolution = false, stretchAspect = 0.65,
-    noDelay = false, doubleHit = false, doubleDelay = 0.04,
     transparency = { enabled = false, level = 0.85 },
     crosshair = { enabled = false, size = 14, thickness = 2, gap = 5, dot = true },
-    budgetRate = 10, budgetCap = 12,
+    budgetRate = 5, budgetCap = 6,
 }
 
-local STATS = { hits = 0, silentHits = 0, counterHits = 0, dodgeRetries = 0 }
+local ENABLE_FEATURES = true
+local ENABLE_SWEEP = true
+
+local VERSION = "v31"
+local CHANGELOG = {
+    { "v31", "auto-weave restored to the original that worked: two wrapper calls per cycle, hold, gap, Heartbeat flags. Removed the 8/s weave bucket and the 0.25s hold floor, hold default back to 0.22, slider min back to 0.10. Grey box name kill from v30 unchanged." },
+    { "v30", "grey box: Assets.VFX.WeaveHighlight is cloned into the character as 'WeaveHIGHLIGHT' and lives 0.4s; killed by name now, 0.1s scan on the local character plus every player's character in the 3s sweep. weave: hold floor 0.25s and an 8/s bucket, because Shared/Net/Remotes declares CombatService.Weave at perSecond 10 burst 10 (Swing 8/12, HitReport 10/14)." },
+    { "v29", "hit reports match the wire format captured by RobloxSpy: seq, the actual hit part (UpperTorso/LowerTorso/Torso, root as last resort) and that part's world position. Hooked attacks already send Swing themselves; the fallback path now sends Swing(seq, 'Attack', limb) before reporting. Weave confirmed as true/false bool, unchanged." },
+    { "v28", "autoload: after forcing remote features off, the Auto-Weave toggle is set back to OFF so the UI stops lying. auto-weave: if Combat.Weave is nil for 3s it notifies on screen instead of idling silently. No change to hits, weave call, or sweep." },
+    { "v27", "headless: replaced with ScriptBlox logic. applyHeadless uses ch:WaitForChild('Head', math.random(6,11)) then sets Head.Transparency = 1 and face.Transparency = 1. restoreHead sets both back to 0 on toggle off. CharacterAdded reapplies 0.33s after spawn when headless is on. Everything else from v26 kept." },
+    { "v26", "removed Killaura, Counter Stun, 4th Punch Reset, Phone Switch, Reset Delay, Custom Sensitivity, Heavy Booster. Renamed Timing -> Attack Speed. Removed dead notePunch, equipPhone, combo state, punchSpeed, counter wiring, sensitivity wiring." },
+    { "v25", "headless: minimal, only Head + face transparency toggled" },
+    { "v24", "headless grey box attempt via accessory handle hiding (reverted in v25)" },
+    { "v23", "auto-weave reverted to working baseline awFire (Fire + FireServer); manualOnly default false" },
+    { "v22", "auto-weave wrapper-only; per-frame WalkSpeed restore; expanded grey-box sweep; instant DescendantAdded kill; showError hoisted; _tick counter moved off the function" },
+    { "v16", "swing remote removed entirely; wrapper-only hit reporting" },
+    { "v15", "reverted to service wrapper (remotes.Client) as only transport" },
+    { "v14", "prune: removed Double Hit, Stomp Speed, Auto Stomp, Style Changer, Anti Debounce, Remote Spy" },
+    { "v13", "weave remote retired: auto-weave presses game's own key instead" },
+    { "v12", "kick bisect: feature and sweep switches, stall watchdog" },
+    { "v11", "load safety: autoload no longer starts remote features" },
+    { "v10", "kick safety: send governor at 5/s, hit multiplier capped at 4" },
+    { "v9", "swing-first: every hit and weave opens a swing" },
+    { "v8", "gui death: ResetOnSpawn guard + on-screen error panel" },
+    { "v7", "nine fixes: weave-hit, grey box, respawn cosmetics, potato graphics, ground targets, range merge, 4th punch, phone switch, tab moves" },
+    { "v6", "exact RE paths: Hitreport, weave, swing + Hitrejected listener" },
+    { "v5", "remote spy + full replicated-tree scan" },
+    { "v4", "crash fix, module discovery, Run Doctor" },
+    { "v3", "weave combat, killaura, configs, real damage numbers" },
+}
+local STATS = { hits = 0, silentHits = 0, greySwept = 0, blocked = 0 }
+
+do
+    local ok, rs = pcall(function() return game:GetService("RunService") end)
+    if ok and rs then
+        local last = os.clock()
+        pcall(function()
+            rs.Heartbeat:Connect(function()
+                local now = os.clock()
+                local dt = now - last
+                last = now
+                if dt > 1.2 and showError then
+                    showError(string.format("stall %.2fs - client froze, not a server kick", dt))
+                end
+            end)
+        end)
+    end
+end
 
 -- =========================== CONFIG FILES ==================================
-local Options = {}      -- UI key -> element, for post-load visual sync
+local Options = {}
 local SelectedConfig = nil
-local spyLog = {}       -- captured FireServer calls, written to YSL/spy.txt
 
 local function hasFS()
     return typeof(writefile) == "function" and typeof(readfile) == "function"
@@ -161,7 +269,6 @@ local function readConfig(name)
     return data
 end
 
--- Schema-safe apply: only keys that already exist in Config are written.
 local function deepApply(dst, src)
     for k, v in pairs(src) do
         if type(v) == "table" and type(dst[k]) == "table" then
@@ -172,29 +279,17 @@ local function deepApply(dst, src)
     end
 end
 
--- UI key -> path inside Config, so a load can push values back into the widgets.
 local SyncList = {
     { "aw_enabled", { "autoWeave", "enabled" } }, { "aw_manual", { "autoWeave", "manualOnly" } },
-    { "aw_hold", { "autoWeave", "hold" } }, { "aw_gap", { "autoWeave", "gap" } },
+    { "aw_hold", { "autoWeave", "hold" } },     { "aw_gap", { "autoWeave", "gap" } },
     { "hb_enabled", { "hitbox", "enabled" } }, { "hb_radius", { "hitbox", "radius" } },
-    { "hb_air", { "hitbox", "airOnly" } },
-    { "noDelay", { "noDelay" } }, { "doubleHit", { "doubleHit" } }, { "doubleDelay", { "doubleDelay" } },
-    { "comboReset", { "comboReset" } }, { "phoneSwitch", { "phoneSwitch" } },
-    { "resetDelay", { "comboResetDelay" } },
+    { "hb_air", { "hitbox", "airOnly" } }, { "hb_ground", { "hitbox", "groundOnly" } },
+    { "noDelay", { "noDelay" } },
     { "autoConnect", { "damage", "autoConnect" } }, { "connectRange", { "damage", "connectRange" } },
     { "hitMult", { "damage", "hitMultiplier", "enabled" } }, { "hitCount", { "damage", "hitMultiplier", "value" } },
     { "hitDelay", { "damage", "hitMultiplier", "delay" } },
-    { "counter_enabled", { "counter", "enabled" } }, { "counter_return", { "counter", "returnFire" } },
-    { "counter_clear", { "counter", "clearStun" } }, { "counter_assert", { "counter", "assert" } },
     { "glide_enabled", { "movement", "glide", "enabled" } }, { "glide_speed", { "movement", "glide", "speed" } },
     { "walk_enabled", { "movement", "walkSpeed", "enabled" } }, { "walk_speed", { "movement", "walkSpeed", "value" } },
-    { "heavyBoost", { "movement", "heavyBoost" } },
-    { "sens_enabled", { "sensitivity", "enabled" } }, { "sens_value", { "sensitivity", "value" } },
-    { "wh_enabled", { "weaveHit", "enabled" } }, { "wh_window", { "weaveHit", "window" } },
-    { "wh_reassert", { "weaveHit", "reassert" } },
-    { "ka_enabled", { "killaura", "enabled" } }, { "ka_radius", { "killaura", "radius" } },
-    { "ka_interval", { "killaura", "interval" } }, { "ka_targets", { "killaura", "maxTargets" } },
-    { "ka_weave", { "killaura", "weaveSync" } },
     { "cross_enabled", { "crosshair", "enabled" } }, { "cross_size", { "crosshair", "size" } },
     { "cross_thick", { "crosshair", "thickness" } }, { "cross_gap", { "crosshair", "gap" } },
     { "cross_dot", { "crosshair", "dot" } },
@@ -216,9 +311,16 @@ local function pathGet(t, path)
     return cur
 end
 
+local function notify(msg)
+    if not (Library and Library.Notify) then return end
+    pcall(function()
+        Library:Notify({ Title = "YSL", Description = tostring(msg), Time = 3 })
+    end)
+end
+
 -- =========================== WINDOW ========================================
 local Window = Library:CreateWindow({
-    Title = "YSL FINAL SHOWDOWN",
+    Title = "YSL FINAL SHOWDOWN (UPDATE SOON)" .. VERSION,
     Footer = "discord.gg/yslrolling",
     Center = true,
     AutoShow = true,
@@ -235,8 +337,11 @@ local Tabs = {
 -- =========================== COMBAT TAB ====================================
 local AW = Tabs.Combat:AddLeftGroupbox("Auto-Weave")
 Options.aw_enabled = AW:AddToggle("aw_enabled", { Text = "Auto-Weave", Default = Config.autoWeave.enabled,
-    Callback = function(v) Config.autoWeave.enabled = v; if v then autoWeaveStart() else autoWeaveStop() end end })
-Options.aw_manual = AW:AddToggle("aw_manual", { Text = "Manual Mode", Default = Config.autoWeave.manualOnly,
+    Callback = function(v)
+        Config.autoWeave.enabled = v
+        if v then autoWeaveStart() else autoWeaveStop() end
+    end })
+Options.aw_manual = AW:AddToggle("aw_manual", { Text = "Manual Mode (weave-gated)", Default = Config.autoWeave.manualOnly,
     Callback = function(v) Config.autoWeave.manualOnly = v end })
 Options.aw_hold = AW:AddSlider("aw_hold", { Text = "Hold", Default = Config.autoWeave.hold,
     Min = 0.10, Max = 0.50, Rounding = 2, Suffix = "s",
@@ -244,30 +349,6 @@ Options.aw_hold = AW:AddSlider("aw_hold", { Text = "Hold", Default = Config.auto
 Options.aw_gap = AW:AddSlider("aw_gap", { Text = "Cycle Gap", Default = Config.autoWeave.gap,
     Min = 0.00, Max = 0.30, Rounding = 2, Suffix = "s",
     Callback = function(v) Config.autoWeave.gap = v end })
-
-local WH = Tabs.Combat:AddLeftGroupbox("Weave Combat")
-Options.wh_enabled = WH:AddToggle("wh_enabled", { Text = "Hit While Weaving", Default = Config.weaveHit.enabled,
-    Callback = function(v) Config.weaveHit.enabled = v; if WeaveHitSet then WeaveHitSet(v) end end })
-Options.wh_window = WH:AddSlider("wh_window", { Text = "Window", Default = Config.weaveHit.window,
-    Min = 0.04, Max = 0.30, Rounding = 2, Suffix = "s",
-    Callback = function(v) Config.weaveHit.window = v end })
-Options.wh_reassert = WH:AddToggle("wh_reassert", { Text = "Resume Weave After Hit", Default = Config.weaveHit.reassert,
-    Callback = function(v) Config.weaveHit.reassert = v end })
-
-local KA = Tabs.Combat:AddLeftGroupbox("Killaura")
-Options.ka_enabled = KA:AddToggle("ka_enabled", { Text = "Killaura", Default = Config.killaura.enabled,
-    Callback = function(v) Config.killaura.enabled = v; if KillAuraSet then KillAuraSet(v) end end })
-Options.ka_radius = KA:AddSlider("ka_radius", { Text = "Radius", Default = Config.killaura.radius,
-    Min = 3, Max = 15, Rounding = 1, Suffix = " studs",
-    Callback = function(v) Config.killaura.radius = v end })
-Options.ka_interval = KA:AddSlider("ka_interval", { Text = "Interval", Default = Config.killaura.interval,
-    Min = 0.03, Max = 0.50, Rounding = 2, Suffix = "s",
-    Callback = function(v) Config.killaura.interval = v end })
-Options.ka_targets = KA:AddSlider("ka_targets", { Text = "Targets Per Cycle", Default = Config.killaura.maxTargets,
-    Min = 1, Max = 5, Rounding = 0,
-    Callback = function(v) Config.killaura.maxTargets = v end })
-Options.ka_weave = KA:AddToggle("ka_weave", { Text = "Sync With Weave", Default = Config.killaura.weaveSync,
-    Callback = function(v) Config.killaura.weaveSync = v end })
 
 local HB = Tabs.Combat:AddRightGroupbox("Hitbox")
 Options.hb_enabled = HB:AddToggle("hb_enabled", { Text = "Hitbox", Default = Config.hitbox.enabled,
@@ -277,22 +358,12 @@ Options.hb_radius = HB:AddSlider("hb_radius", { Text = "Radius", Default = Confi
     Callback = function(v) Config.hitbox.radius = v end })
 Options.hb_air = HB:AddToggle("hb_air", { Text = "Airborne Targets Only", Default = Config.hitbox.airOnly,
     Callback = function(v) Config.hitbox.airOnly = v end })
+Options.hb_ground = HB:AddToggle("hb_ground", { Text = "Grounded Targets Only", Default = Config.hitbox.groundOnly,
+    Callback = function(v) Config.hitbox.groundOnly = v end })
 
-local TM = Tabs.Combat:AddRightGroupbox("Timing")
-Options.noDelay = TM:AddToggle("noDelay", { Text = "No Punch Delay", Default = Config.noDelay,
+local AS = Tabs.Combat:AddRightGroupbox("Attack Speed")
+Options.noDelay = AS:AddToggle("noDelay", { Text = "No Punch Delay", Default = Config.noDelay,
     Callback = function(v) Config.noDelay = v end })
-Options.doubleHit = TM:AddToggle("doubleHit", { Text = "Double Hit", Default = Config.doubleHit,
-    Callback = function(v) Config.doubleHit = v end })
-Options.doubleDelay = TM:AddSlider("doubleDelay", { Text = "Double Delay", Default = Config.doubleDelay,
-    Min = 0.00, Max = 0.20, Rounding = 2, Suffix = "s",
-    Callback = function(v) Config.doubleDelay = v end })
-Options.comboReset = TM:AddToggle("comboReset", { Text = "4th Punch Reset", Default = Config.comboReset,
-    Callback = function(v) Config.comboReset = v end })
-Options.phoneSwitch = TM:AddToggle("phoneSwitch", { Text = "Phone Switch", Default = Config.phoneSwitch,
-    Callback = function(v) Config.phoneSwitch = v end })
-Options.resetDelay = TM:AddSlider("resetDelay", { Text = "Reset Delay", Default = Config.comboResetDelay,
-    Min = 0.00, Max = 1.00, Rounding = 2, Suffix = "s",
-    Callback = function(v) Config.comboResetDelay = v end })
 
 local DMG = Tabs.Combat:AddRightGroupbox("Damage")
 Options.autoConnect = DMG:AddToggle("autoConnect", { Text = "Auto Connect", Default = Config.damage.autoConnect,
@@ -309,15 +380,24 @@ Options.hitDelay = DMG:AddSlider("hitDelay", { Text = "Hit Spacing", Default = C
     Min = 0.02, Max = 0.30, Rounding = 2, Suffix = "s",
     Callback = function(v) Config.damage.hitMultiplier.delay = v end })
 
-local CT = Tabs.Combat:AddRightGroupbox("Counter Stun")
-Options.counter_enabled = CT:AddToggle("counter_enabled", { Text = "Enable Counter Stun", Default = false,
-    Callback = function(v) CounterEnabled = v; Config.counter.enabled = v end })
-Options.counter_return = CT:AddToggle("counter_return", { Text = "Return Fire", Default = true,
-    Callback = function(v) CounterReturn = v; Config.counter.returnFire = v end })
-Options.counter_clear = CT:AddToggle("counter_clear", { Text = "Clear Stun", Default = true,
-    Callback = function(v) CounterClear = v; Config.counter.clearStun = v end })
-Options.counter_assert = CT:AddToggle("counter_assert", { Text = "Assert Weave", Default = true,
-    Callback = function(v) CounterAssert = v; Config.counter.assert = v end })
+local LR = Tabs.Combat:AddRightGroupbox("Long Range")
+Options.lr_enabled = LR:AddToggle("lr_enabled", { Text = "Long Range", Default = Config.longRange.enabled,
+    Callback = function(v) Config.longRange.enabled = v end })
+
+local modeButton
+modeButton = LR:AddButton({
+    Text = "Mode: " .. Config.longRange.mode,
+    Func = function()
+        Config.longRange.mode = (Config.longRange.mode == "position") and "midpoint" or "position"
+        if modeButton and modeButton.SetText then
+            pcall(function() modeButton:SetText("Mode: " .. Config.longRange.mode) end)
+        end
+    end,
+})
+
+Options.lr_radius = LR:AddSlider("lr_radius", { Text = "Max Radius", Default = Config.longRange.maxRadius,
+    Min = 10, Max = 15.2, Rounding = 1,
+    Callback = function(v) Config.longRange.maxRadius = math.min(v, 15.2) end })
 
 -- =========================== MOVEMENT TAB ==================================
 local GL = Tabs.Movement:AddLeftGroupbox("Weave Glide")
@@ -333,15 +413,6 @@ Options.walk_enabled = WK:AddToggle("walk_enabled", { Text = "Walkspeed", Defaul
 Options.walk_speed = WK:AddSlider("walk_speed", { Text = "Walkspeed Value", Default = Config.movement.walkSpeed.value,
     Min = 16, Max = 100, Rounding = 0,
     Callback = function(v) Config.movement.walkSpeed.value = v end })
-Options.heavyBoost = WK:AddToggle("heavyBoost", { Text = "Heavy Booster", Default = Config.movement.heavyBoost,
-    Callback = function(v) Config.movement.heavyBoost = v end })
-
-local SE = Tabs.Movement:AddRightGroupbox("Sensitivity")
-Options.sens_enabled = SE:AddToggle("sens_enabled", { Text = "Custom Sensitivity", Default = Config.sensitivity.enabled,
-    Callback = function(v) Config.sensitivity.enabled = v; if ApplySensitivity then ApplySensitivity() end end })
-Options.sens_value = SE:AddSlider("sens_value", { Text = "Multiplier", Default = Config.sensitivity.value,
-    Min = 0.20, Max = 3.00, Rounding = 2,
-    Callback = function(v) Config.sensitivity.value = v; if ApplySensitivity then ApplySensitivity() end end })
 
 -- =========================== VISUALS TAB ===================================
 local CR = Tabs.Visuals:AddLeftGroupbox("Crosshair")
@@ -365,44 +436,25 @@ Options.trans_level = TR:AddSlider("trans_level", { Text = "Transparency Level",
         if Config.transparency.enabled and ApplyTransparency then ApplyTransparency(LP.Character) end
     end })
 
--- =========================== MISC TAB ======================================
-local DG = Tabs.Misc:AddLeftGroupbox("Dodge")
-Options.noStun = DG:AddToggle("noStun", { Text = "Anti Weave Stun", Default = Config.dodge.noStun,
-    Callback = function(v) Config.dodge.noStun = v end })
-Options.hitThrough = DG:AddToggle("hitThrough", { Text = "Hit Through Weave", Default = Config.dodge.hitThrough,
-    Callback = function(v) Config.dodge.hitThrough = v end })
-
-local LR = Tabs.Misc:AddRightGroupbox("Long Range")
-Options.lr_enabled = LR:AddToggle("lr_enabled", { Text = "Long Range", Default = Config.longRange.enabled,
-    Callback = function(v) Config.longRange.enabled = v end })
-
-local modeButton
-modeButton = LR:AddButton({
-    Text = "Mode: " .. Config.longRange.mode,
-    Func = function()
-        Config.longRange.mode = (Config.longRange.mode == "position") and "midpoint" or "position"
-        if modeButton and modeButton.SetText then
-            pcall(function() modeButton:SetText("Mode: " .. Config.longRange.mode) end)
-        end
-    end,
-})
-
-Options.lr_radius = LR:AddSlider("lr_radius", { Text = "Max Radius", Default = Config.longRange.maxRadius,
-    Min = 10, Max = 15.2, Rounding = 1,
-    Callback = function(v) Config.longRange.maxRadius = math.min(v, 15.2) end })
-
-local CS = Tabs.Misc:AddLeftGroupbox("Cosmetics")
+local CS = Tabs.Visuals:AddLeftGroupbox("Cosmetics")
 Options.headless = CS:AddToggle("headless", { Text = "Headless", Default = Config.headless,
     Callback = function(v) Config.headless = v; if HeadlessToggle then HeadlessToggle(v) end end })
 Options.philly = CS:AddToggle("philly", { Text = "Philly Style", Default = Config.philly,
     Callback = function(v) Config.philly = v; if PhillyToggle then PhillyToggle(v) end end })
-Options.lowGraphics = CS:AddToggle("lowGraphics", { Text = "Low Graphics", Default = Config.lowGraphics,
+Options.lowGraphics = CS:AddToggle("lowGraphics", { Text = "Potato Graphics", Default = Config.lowGraphics,
     Callback = function(v) Config.lowGraphics = v; if LowGraphicsToggle then LowGraphicsToggle(v) end end })
 Options.stretchRes = CS:AddToggle("stretchRes", { Text = "Stretch Resolution", Default = Config.stretchResolution,
     Callback = function(v) Config.stretchResolution = v; if StretchToggle then StretchToggle(v) end end })
 Options.stretchAspect = CS:AddSlider("stretchAspect", { Text = "Stretch Aspect", Default = Config.stretchAspect,
     Min = 0.35, Max = 1.00, Rounding = 2,
     Callback = function(v) Config.stretchAspect = v; if SetStretchAspect then SetStretchAspect(v) end end })
+
+-- =========================== MISC TAB ======================================
+local DG = Tabs.Misc:AddLeftGroupbox("Dodge")
+Options.noStun = DG:AddToggle("noStun", { Text = "Anti Weave Stun (VISUALLY WORKS)", Default = Config.dodge.noStun,
+    Callback = function(v) Config.dodge.noStun = v end })
+Options.hitThrough = DG:AddToggle("hitThrough", { Text = "Hit Through Weave (MIGHT NOT WORK)", Default = Config.dodge.hitThrough,
+    Callback = function(v) Config.dodge.hitThrough = v end })
 
 local DN = Tabs.Misc:AddRightGroupbox("Damage Numbers")
 Options.dmgNums = DN:AddToggle("dmgNums", { Text = "Damage Numbers", Default = Config.damageNumbers,
@@ -430,7 +482,6 @@ if cfgDropdown and cfgDropdown.SetValue then
     pcall(function() cfgDropdown:SetValue(cfgValues[1]) end)
 end
 
--- Obsidian has no AddTextbox; the text input is AddInput.
 Options.cfg_name = CFG:AddInput("cfg_name", {
     Text = "Config Name",
     Placeholder = "type a name",
@@ -446,13 +497,6 @@ local function refreshDropdown()
     elseif cfgDropdown and cfgDropdown.RefreshPool then
         pcall(function() cfgDropdown:RefreshPool() end)
     end
-end
-
-local function notify(msg)
-    if not (Library and Library.Notify) then return end
-    pcall(function()
-        Library:Notify({ Title = "YSL", Description = tostring(msg), Time = 3 })
-    end)
 end
 
 CFG:AddButton({ Text = "Save", Func = function()
@@ -507,37 +551,28 @@ CFG2:AddButton({ Text = "Run Doctor", Func = function()
     if RunDoctor then RunDoctor() else notify("Features never loaded - check console") end
 end })
 
-local SPY = Tabs.Misc:AddLeftGroupbox("Remote Spy")
-SPY:AddButton({ Text = "Capture 10s (punch once)", Func = function()
-    if StartSpy then StartSpy(10) else notify("Features never loaded") end
-end })
-SPY:AddButton({ Text = "Capture 30s", Func = function()
-    if StartSpy then StartSpy(30) else notify("Features never loaded") end
-end })
-SPY:AddButton({ Text = "Dump Spy Log", Func = function()
-    if DumpSpy then DumpSpy() else notify("Features never loaded") end
-end })
-
 -- =========================== FEATURE CODE ==================================
 local featureOk, featureErr = pcall(function()
+
+if not ENABLE_FEATURES then
+    print("[YSL] features disabled by ENABLE_FEATURES - UI only")
+    return
+end
 
 local Remotes, Combat, AttackState, HitWindow, Hitboxes, CharacterController, DataController, Classes
 local Active = { Weaving = false, OpenFrame = false, CanAttack = false, Seq = 0, CurrentM1 = nil }
 local HITBOX_MAX = 15.2
-local SERVER_REACH = 5.8
 local watchedChar, lastStun = nil, false
 local lastStunClearAt = 0
-local lastCounterAt = 0
 local suppressHookReport = false
-local dodgePending = setmetatable({}, { __mode = "k" })
 local origHWStart, origHBStart, origHitReportFire
-local learnedHitArgs = nil  -- argument shape captured from the real hit remote
-local counterSetupChar, counterConn
-local budget = { tokens = 12, rate = 10, cap = 12, last = os.clock() }
+local learnedHitArgs = nil
+local lastRejectAt = 0
+local budget = { tokens = 6, rate = 5, cap = 6, last = os.clock() }
 
 local function syncBudgets()
-    budget.rate = Config.budgetRate or 10
-    budget.cap = Config.budgetCap or 12
+    budget.rate = Config.budgetRate or 5
+    budget.cap = Config.budgetCap or 6
     if budget.tokens > budget.cap then budget.tokens = budget.cap end
 end
 
@@ -545,7 +580,10 @@ local function takeToken()
     local now = os.clock()
     budget.tokens = math.min(budget.cap, budget.tokens + (now - budget.last) * budget.rate)
     budget.last = now
-    if budget.tokens < 1 then return false end
+    if budget.tokens < 1 then
+        STATS.blocked = (STATS.blocked or 0) + 1
+        return false
+    end
     budget.tokens = budget.tokens - 1
     return true
 end
@@ -603,6 +641,20 @@ local function collect(radius)
     return out
 end
 
+local function isAirborne(hum)
+    if not hum then return false end
+    local ok, mat = pcall(function() return hum.FloorMaterial end)
+    if not ok then return false end
+    return mat == Enum.Material.Air
+end
+
+local function effectiveRange()
+    local r = Config.hitbox.radius or 7
+    if Config.damage.autoConnect then r = math.max(r, Config.damage.connectRange or r) end
+    if Config.longRange.enabled then r = math.max(r, Config.longRange.maxRadius or r) end
+    return math.min(r, HITBOX_MAX)
+end
+
 local function spoofPos(t)
     local r = myRoot(); if not r then return t.root.Position end
     if Config.longRange.mode == "position" then return r.Position + r.CFrame.LookVector * 2 end
@@ -610,7 +662,6 @@ local function spoofPos(t)
     return t.root.Position
 end
 
--- Dispatch a remote whether it is a real Instance or a wrapper table.
 local function fireRemote(remote, ...)
     if not remote then return false end
     local args = table.pack(...)
@@ -628,6 +679,17 @@ local function fireRemote(remote, ...)
         return pcall(function() remote:FireServer(table.unpack(args, 1, args.n)) end)
     end
     return false
+end
+
+local function brief(v)
+    local t = typeof(v)
+    if t == "table" then
+        local n = 0
+        for _ in pairs(v) do n = n + 1 end
+        return "table(" .. n .. ")"
+    end
+    if t == "string" then return string.sub(v, 1, 80) end
+    return tostring(v)
 end
 
 local function stopStunAnims()
@@ -668,17 +730,7 @@ local function animPlayingNow()
     return false
 end
 
--- Pure read: does NOT touch the auto-weave gate timers.
-local function weaveActiveNow()
-    if Active and Active.Weaving == true then return true end
-    if CharacterController then
-        local ok, w = pcall(function() return CharacterController:Is("Weaving") end)
-        if ok and w == true then return true end
-    end
-    return animPlayingNow()
-end
-
-local aw = { cycleActive = false, cycleTask = nil, cycles = 0, lastAnimAt = 0, lastStateTrueAt = 0, gateOpenUntil = 0 }
+local aw = { cycleActive = false, cycleTask = nil, cycles = 0, lastAnimAt = 0, lastStateTrueAt = 0, gateOpenUntil = 0, weaveSentAt = 0 }
 
 local function weavingNow()
     local now = os.clock()
@@ -700,9 +752,17 @@ local function weavingNow()
     return now < aw.gateOpenUntil
 end
 
+local function weaveActiveNow()
+    if aw.weaveSentAt > 0 then return true end
+    if Active and Active.Weaving == true then return true end
+    if CharacterController then
+        local ok, w = pcall(function() return CharacterController:Is("Weaving") end)
+        if ok and w == true then return true end
+    end
+    return animPlayingNow()
+end
+
 -- =========================== DAMAGE NUMBERS ================================
--- No Part is created: the BillboardGui hangs off the target part, so nothing
--- can be left behind in the world (or inside your own character).
 
 local function floatDamage(rootPart, amount)
     if not Config.damageNumbers then return end
@@ -736,43 +796,57 @@ end
 
 -- =========================== COMBAT ========================================
 
--- Attack sequence: the real one when AttackState resolved, otherwise a local
--- counter. Sending a constant 0 gets rejected by servers that track sequence.
 local function currentSeq()
     if AttackState and AttackState.Active then return Active.Seq end
     Active.Seq = (Active.Seq or 0) + 1
     return Active.Seq
 end
 
+-- Wire format confirmed from the game's own traffic: the third argument is the
+-- part that was hit and the fourth is that part's world position, not the root.
+local TORSO_ORDER = { "UpperTorso", "LowerTorso", "Torso" }
+local function hitPartOf(t)
+    local ch = t and t.char
+    if ch then
+        for _, nm in ipairs(TORSO_ORDER) do
+            local p = ch:FindFirstChild(nm)
+            if p and p:IsA("BasePart") then return p end
+        end
+    end
+    return t and t.root
+end
+
+local swingLimbFlip = false
+local function swingFor(seq)
+    if not Combat or not Combat.Swing then return false end
+    swingLimbFlip = not swingLimbFlip
+    local limb = swingLimbFlip and "LeftHand" or "RightHand"
+    return fireRemote(Combat.Swing, seq, "Attack", limb)
+end
+
 local function reportOnce(seq, target)
     if not Combat or not Combat.HitReport then return false end
     if not target or not target.root or not target.root:IsA("BasePart") then return false end
-    if Config.hitbox.airOnly then
-        local hum = target.hum
-        if hum and hum:GetState() ~= Enum.HumanoidStateType.Freefall then return false end
-    end
-    local limit = HITBOX_MAX
-    if Config.longRange.enabled then
-        limit = math.min(HITBOX_MAX, Config.longRange.maxRadius or HITBOX_MAX)
-    end
-    if target.dist and target.dist > limit then return false end
+    if Config.hitbox.airOnly and not isAirborne(target.hum) then return false end
+    if Config.hitbox.groundOnly and isAirborne(target.hum) then return false end
+    if target.dist and target.dist > HITBOX_MAX then return false end
     if not takeToken() then return false end
 
     local hum = target.hum
     local before = (hum and hum.Health) or nil
-    local pos = target.root.Position
+    local part = hitPartOf(target) or target.root
+    local pos = part.Position
     if Config.longRange.enabled then pos = spoofPos(target) end
 
     local ok
     if typeof(Combat.HitReport) == "Instance" and learnedHitArgs then
-        -- Replay the real call shape, swapping in this target's part and position.
         local out, n = {}, 0
         for i = 1, learnedHitArgs.n do
             local v = learnedHitArgs[i]
             local t = typeof(v)
             if t == "Instance" then
                 local okp, isPart = pcall(function() return v:IsA("BasePart") end)
-                out[i] = (okp and isPart) and target.root or v
+                out[i] = (okp and isPart) and part or v
             elseif t == "Vector3" then
                 out[i] = pos
             else
@@ -782,12 +856,11 @@ local function reportOnce(seq, target)
         end
         ok = fireRemote(Combat.HitReport, table.unpack(out, 1, n))
     else
-        ok = fireRemote(Combat.HitReport, seq, target.root, pos)
+        ok = fireRemote(Combat.HitReport, seq, part, pos)
     end
     if not ok then return false end
 
     STATS.hits = STATS.hits + 1
-    -- Real damage: difference in the target's own health, not a fake counter.
     if before then
         task.delay(0.18, function()
             if hum and hum.Parent then
@@ -801,7 +874,7 @@ end
 
 local function silentHitMulti(seq, targets)
     if not Config.damage.hitMultiplier.enabled then return end
-    local hits = math.floor(Config.damage.hitMultiplier.value or 1)
+    local hits = math.min(4, math.floor(Config.damage.hitMultiplier.value or 1))
     if hits <= 1 then return end
     local delay = Config.damage.hitMultiplier.delay or 0.08
     for i = 2, hits do
@@ -821,13 +894,12 @@ local function silentHitMulti(seq, targets)
     end
 end
 
--- Fallback attack trigger: if the game's HitWindow never resolves, M1/touch
--- still drives hitbox and silent hits.
 local function attackTrigger()
     if not (Config.hitbox.enabled or Config.damage.autoConnect) then return end
     if not Combat or not Combat.HitReport then return end
-                        local seq = currentSeq()
-    local targets = collect(Config.damage.autoConnect and Config.damage.connectRange or Config.hitbox.radius)
+    local seq = currentSeq()
+    if not origHWStart then swingFor(seq) end
+    local targets = collect(effectiveRange())
     if #targets == 0 then return end
     task.delay(0.02, function()
         local hitT = {}
@@ -842,17 +914,12 @@ local function hookCombat()
     if not HitWindow or not origHWStart then return end
     HitWindow.Start = function(kind, limb, track, group)
         local r = origHWStart(kind, limb, track, group)
-        if kind == "Attack" and not suppressHookReport then
-            if Config.punchSpeed.enabled and Active.CurrentM1 then
-                pcall(function() Active.CurrentM1:AdjustSpeed(Config.punchSpeed.value) end)
-            end
-        end
         if Config.damage.noAttackDelay or Config.noDelay then
             Active.OpenFrame = true; Active.CanAttack = true
         end
         if not suppressHookReport and (Config.hitbox.enabled or Config.damage.autoConnect) then
-                                local seq = currentSeq()
-            local targets = collect(Config.damage.autoConnect and Config.damage.connectRange or Config.hitbox.radius)
+            local seq = currentSeq()
+            local targets = collect(effectiveRange())
             if #targets > 0 then
                 task.delay(0.02, function()
                     local hitT = {}
@@ -869,128 +936,6 @@ local function hookCombat()
     end
 end
 
--- =========================== WEAVE BYPASS (hit while weaving) ==============
--- Shared by Weave Combat and Killaura. Never touches the auto-weave loop.
-
-local pendingRestores = 0
-
-local function weaveBypass(fn)
-    local wasWeaving = (Active and Active.Weaving == true) or weaveActiveNow()
-    pcall(function() Active.Weaving = false end)
-    pcall(function() Active.CanAttack = true end)
-    pcall(function() Active.OpenFrame = true end)
-    pendingRestores = pendingRestores + 1
-    local ok = pcall(fn)
-    task.delay(Config.weaveHit.restoreDelay or 0.06, function()
-        pendingRestores = pendingRestores - 1
-        if pendingRestores > 0 then return end
-        pcall(function() Active.Weaving = wasWeaving end)
-        if wasWeaving and Config.weaveHit.reassert and Combat and Combat.Weave then
-            fireRemote(Combat.Weave, true)
-        end
-        aw.lastAnimAt = os.clock()
-    end)
-    return ok
-end
-
-local wh = { running = false, task = nil }
-WeaveHitSet = function(on)
-    wh.running = on
-    if not on then
-        if wh.task then pcall(function() task.cancel(wh.task) end) wh.task = nil end
-        return
-    end
-    if wh.task then return end
-    wh.task = task.spawn(function()
-        while wh.running do
-            if Config.weaveHit.enabled and weaveActiveNow() and Combat and Combat.HitReport then
-                local targets = collect(Config.hitbox.radius)
-                if #targets > 0 then
-                    local seq = currentSeq()
-                    weaveBypass(function()
-                        for _, t in ipairs(targets) do
-                            if dealing(t) then reportOnce(seq, t) break end
-                        end
-                    end)
-                end
-                task.wait(math.max(0.03, Config.weaveHit.window))
-            else
-                task.wait(0.05)
-            end
-        end
-        wh.task = nil
-    end)
-end
-
-local ka = { running = false, task = nil }
-KillAuraSet = function(on)
-    ka.running = on
-    if not on then
-        if ka.task then pcall(function() task.cancel(ka.task) end) ka.task = nil end
-        return
-    end
-    if ka.task then return end
-    ka.task = task.spawn(function()
-        while ka.running do
-            if Config.killaura.enabled and Combat and Combat.HitReport then
-                local targets = collect(Config.killaura.radius)
-                local n = math.min(#targets, math.floor(Config.killaura.maxTargets or 1))
-                if n > 0 then
-                    local seq = currentSeq()
-                    local function hitAll()
-                        for i = 1, n do
-                            local t = targets[i]
-                            if dealing(t) then reportOnce(seq, t) end
-                        end
-                    end
-                    if Config.killaura.weaveSync and weaveActiveNow() then
-                        weaveBypass(hitAll)
-                    else
-                        hitAll()
-                    end
-                end
-                task.wait(math.max(0.03, Config.killaura.interval))
-            else
-                task.wait(0.1)
-            end
-        end
-        ka.task = nil
-    end)
-end
-
--- =========================== COUNTER STUN ==================================
-
-local function setupCounterStun(ch)
-    if counterSetupChar == ch then return end
-    if counterConn then pcall(function() counterConn:Disconnect() end); counterConn = nil end
-    counterSetupChar = ch
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid"); if not hum then return end
-    local lastHP = hum.Health
-    counterConn = hum.HealthChanged:Connect(function(newHP)
-        local previous = lastHP
-        lastHP = newHP
-        if not CounterEnabled then return end
-        if newHP >= previous then return end
-        if os.clock() - lastCounterAt < 0.1 then return end
-        lastCounterAt = os.clock()
-        if CounterClear then
-            pcall(function() ch:SetAttribute("WeaveStun", false) end)
-            stopStunAnims()
-        end
-        if CounterAssert and Combat and Combat.Weave then
-            fireRemote(Combat.Weave, true)
-        end
-        if CounterReturn and Combat and Combat.HitReport then
-            local r = Config.hitbox.radius > 0 and Config.hitbox.radius or 7
-            for _, t in ipairs(collect(r)) do
-                if dealing(t) and reportOnce(currentSeq(), t) then
-                    STATS.counterHits = STATS.counterHits + 1
-                end
-            end
-        end
-    end)
-end
-
 -- =========================== AUTO-WEAVE ====================================
 
 local function gateOpen()
@@ -1001,14 +946,28 @@ end
 
 local function awFire(state)
     if not Combat or not Combat.Weave then return end
-    fireRemote(Combat.Weave, state)
+    pcall(function() Combat.Weave:Fire(state) end)
+    pcall(function() Combat.Weave:FireServer(state) end)
+    if state then
+        aw.weaveSentAt = os.clock()
+    else
+        aw.weaveSentAt = 0
+    end
 end
 
 autoWeaveStart = function()
     if aw.cycleActive then return end
     aw.cycleActive = true
     aw.cycleTask = task.spawn(function()
-        while aw.cycleActive and (not Combat or not Combat.Weave) do task.wait(0.1) end
+        local waited, told = 0, false
+        while aw.cycleActive and (not Combat or not Combat.Weave) do
+            task.wait(0.1)
+            waited = waited + 0.1
+            if not told and waited >= 3 then
+                told = true
+                notify("Auto-Weave idle: Combat.Weave = nil (Run Doctor)")
+            end
+        end
         while aw.cycleActive do
             if not Config.autoWeave.enabled then
                 task.wait(0.1)
@@ -1026,8 +985,12 @@ end
 
 autoWeaveStop = function()
     aw.cycleActive = false
+    aw.weaveSentAt = 0
     if aw.cycleTask then pcall(function() task.cancel(aw.cycleTask) end) aw.cycleTask = nil end
-    awFire(false)
+    if Combat and Combat.Weave then
+        pcall(function() Combat.Weave:Fire(false) end)
+        pcall(function() Combat.Weave:FireServer(false) end)
+    end
 end
 
 -- =========================== TRANSPARENCY ==================================
@@ -1117,36 +1080,6 @@ RebuildCrosshair = function()
     end
 end
 
--- =========================== SENSITIVITY ===================================
--- Mouse: native, exact. Touch: poke the PlayerModule camera controller if it
--- exposes a sensitivity field (Delta has the hooks needed for this path).
-
-ApplySensitivity = function()
-    local v = Config.sensitivity.enabled and Config.sensitivity.value or 1
-    local applied = false
-    pcall(function()
-        if UserInputService.MouseDeltaSensitivity ~= nil then
-            UserInputService.MouseDeltaSensitivity = v
-            applied = true
-        end
-    end)
-    if UserInputService.TouchEnabled then
-        pcall(function()
-            local ps = LP:FindFirstChild("PlayerScripts")
-            local pm = ps and ps:FindFirstChild("PlayerModule")
-            if not pm then return end
-            local mod = require(pm)
-            local ctrl = mod.activeCameraController
-            local input = ctrl and ctrl.cameraInput
-            if not input then return end
-            for _, field in ipairs({ "mouseSensitivity", "touchSensitivity", "gamepadSensitivity" }) do
-                if input[field] ~= nil then input[field] = v; applied = true end
-            end
-        end)
-    end
-    return applied
-end
-
 -- =========================== GLIDE =========================================
 
 local glideBody = Instance.new("BodyVelocity")
@@ -1163,17 +1096,15 @@ local function stopGlide()
     glideBody.Parent = nil
 end
 
--- Only moves while you are actually weaving, and stops the frame the weave ends.
 local function updateGlide(rp, hum)
     if not Config.movement.glide.enabled or not rp or not hum or hum.Health <= 0 then stopGlide(); return end
     if not weaveActiveNow() then stopGlide(); return end
     local mv = hum.MoveDirection
-    if mv.Magnitude < 0.05 then
-        local lk = rp.CFrame.LookVector; mv = Vector3.new(lk.X, 0, lk.Z)
-    end
     if mv.Magnitude < 0.05 then stopGlide(); return end
+    local horiz = Vector3.new(mv.X, 0, mv.Z)
+    if horiz.Magnitude < 0.05 then stopGlide(); return end
     if glideBody.Parent ~= rp then glideBody.Parent = rp end
-    glideBody.Velocity = mv.Unit * Config.movement.glide.speed
+    glideBody.Velocity = horiz.Unit * Config.movement.glide.speed
     glideOn = true
 end
 
@@ -1181,10 +1112,14 @@ end
 
 local lightingBackup
 
+-- v27: headless uses the ScriptBlox logic.
+-- applyHeadless waits for Head with a random 6-11s timeout (returns
+-- immediately when Head is present), then sets Head and face transparency
+-- to 1. restoreHead sets both back to 0 on toggle off.
 local function applyHeadless(ch)
     if not ch then return end
-    local h = ch:FindFirstChild("Head")
-    if h then
+    local ok, h = pcall(function() return ch:WaitForChild("Head", math.random(6, 11)) end)
+    if ok and h then
         h.Transparency = 1
         local f = h:FindFirstChild("face")
         if f then f.Transparency = 1 end
@@ -1227,26 +1162,152 @@ LowGraphicsToggle = function(on)
                 FogStart = Lighting.FogStart,
                 FogEnd = Lighting.FogEnd,
                 Ambient = Lighting.Ambient,
+                OutdoorAmbient = Lighting.OutdoorAmbient,
+                EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale,
+                EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale,
+                ClockTime = Lighting.ClockTime,
+                effects = {},
             }
+            for _, e in ipairs(Lighting:GetChildren()) do
+                if e:IsA("PostEffect") then
+                    table.insert(lightingBackup.effects, { inst = e, enabled = e.Enabled })
+                end
+            end
+        end
+        for _, rec in ipairs(lightingBackup.effects) do
+            pcall(function() rec.inst.Enabled = false end)
         end
         pcall(function()
             Lighting.GlobalShadows = false
-            Lighting.Brightness = 2
+            Lighting.Brightness = 3
             Lighting.FogStart = 0
             Lighting.FogEnd = 100000
-            Lighting.Ambient = Color3.fromRGB(120, 120, 120)
+            Lighting.Ambient = Color3.fromRGB(160, 160, 160)
+            Lighting.OutdoorAmbient = Color3.fromRGB(160, 160, 160)
+            Lighting.EnvironmentDiffuseScale = 0
+            Lighting.EnvironmentSpecularScale = 0
+            Lighting.ClockTime = 13.5
+        end)
+        pcall(function()
+            local t = workspace:FindFirstChildOfClass("Terrain")
+            if t then
+                t.WaterWaveSize = 0
+                t.WaterWaveSpeed = 0
+                t.WaterReflectance = 0
+                t.WaterTransparency = 1
+            end
+        end)
+        pcall(function()
+            for _, inst in ipairs(workspace:GetChildren()) do
+                if inst:IsA("ParticleEmitter") or inst:IsA("Fire")
+                    or inst:IsA("Smoke") or inst:IsA("Sparkles") then
+                    inst.Enabled = false
+                end
+            end
+        end)
+        pcall(function() settings().Rendering.QualityLevel = 1 end)
+        pcall(function()
+            UserSettings():GetService("UserGameSettings").SavedQualityLevel =
+                Enum.SavedQualitySetting.QualityLevel1
         end)
     elseif lightingBackup then
         local b = lightingBackup
         lightingBackup = nil
+        for _, rec in ipairs(b.effects or {}) do
+            pcall(function() rec.inst.Enabled = rec.enabled end)
+        end
         pcall(function()
             Lighting.GlobalShadows = b.GlobalShadows
             Lighting.Brightness = b.Brightness
             Lighting.FogStart = b.FogStart
             Lighting.FogEnd = b.FogEnd
             Lighting.Ambient = b.Ambient
+            Lighting.OutdoorAmbient = b.OutdoorAmbient
+            Lighting.EnvironmentDiffuseScale = b.EnvironmentDiffuseScale
+            Lighting.EnvironmentSpecularScale = b.EnvironmentSpecularScale
+            Lighting.ClockTime = b.ClockTime
         end)
+        pcall(function() settings().Rendering.QualityLevel = 21 end)
     end
+end
+
+-- =========================== VISUAL CLEANUP ================================
+
+local sweepTickCounter = 0
+
+local function visualizerName(nm)
+    nm = string.lower(tostring(nm or ""))
+    return nm:find("visual", 1, true) or nm:find("hitbox", 1, true)
+        or nm:find("point", 1, true) or nm:find("debug", 1, true)
+end
+
+-- The game clones Assets.VFX.WeaveHighlight into a character, renames it
+-- "WeaveHIGHLIGHT" and destroys it 0.4s later. It is parented straight to the
+-- character, not to an Attachment, and it is not always a Highlight instance.
+local function killWeaveHighlight(inst)
+    if not inst or not inst.Parent then return false end
+    local nm = string.lower(tostring(inst.Name or ""))
+    if string.find(nm, "weavehigh", 1, true) then
+        pcall(function() inst:Destroy() end)
+        STATS.greySwept = (STATS.greySwept or 0) + 1
+        return true
+    end
+    return false
+end
+
+local function sweepDebugVisuals(alsoVisualizer)
+    if alsoVisualizer and Hitboxes and type(Hitboxes.SetVisualizer) == "function" then
+        pcall(function() Hitboxes:SetVisualizer(false) end)
+    end
+    local destroyed = 0
+    local function nuke(root)
+        if not root then return end
+        local ok, kids = pcall(function() return root:GetDescendants() end)
+        if not ok or type(kids) ~= "table" then return end
+        for _, inst in ipairs(kids) do
+            if killWeaveHighlight(inst) then
+                destroyed = destroyed + 1
+            else
+                local cn = inst.ClassName
+                if cn == "BoxHandleAdornment" or cn == "SelectionBox" or cn == "SurfaceSelection"
+                    or cn == "SelectionSphere" or cn == "Highlight" then
+                    pcall(function() inst:Destroy() end)
+                    destroyed = destroyed + 1
+                elseif inst:IsA("BasePart") and inst.Parent and inst.Parent:IsA("Attachment")
+                    and visualizerName(inst.Name) then
+                    pcall(function() inst:Destroy() end)
+                    destroyed = destroyed + 1
+                end
+            end
+        end
+    end
+    for _, p in ipairs(Players:GetPlayers()) do
+        nuke(p.Character)
+    end
+    nuke(workspace.CurrentCamera)
+    sweepTickCounter = sweepTickCounter + 1
+    if sweepTickCounter % 3 == 0 then
+        local ch = LP.Character
+        if ch then
+            local origin = ch:GetPivot().Position
+            local rad = 60
+            local ok, all = pcall(function() return workspace:GetDescendants() end)
+            if ok and type(all) == "table" then
+                for _, inst in ipairs(all) do
+                    if inst:IsA("BasePart") and inst.Parent and inst.Parent:IsA("Attachment")
+                        and visualizerName(inst.Name) then
+                        local okp, p = pcall(function() return inst.Position end)
+                        if okp and p and (p - origin).Magnitude <= rad then
+                            pcall(function() inst:Destroy() end)
+                            destroyed = destroyed + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    STATS.greySwept = (STATS.greySwept or 0) + destroyed
+    return destroyed
 end
 
 local stretchConn
@@ -1292,6 +1353,7 @@ end
 -- =========================== HEARTBEAT =====================================
 
 local lastTransAt = 0
+local lastKillScanAt = 0
 
 RunService.Heartbeat:Connect(function()
     local ch = LP.Character
@@ -1326,22 +1388,32 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
+    if ch then
+        local killNow = os.clock()
+        if killNow - lastKillScanAt > 0.1 then
+            lastKillScanAt = killNow
+            local okKids, kids = pcall(function() return ch:GetChildren() end)
+            if okKids and type(kids) == "table" then
+                for _, inst in ipairs(kids) do
+                    killWeaveHighlight(inst)
+                end
+            end
+        end
+    end
+
     if hum then
-        if Config.movement.walkSpeed.enabled then hum.WalkSpeed = Config.movement.walkSpeed.value end
-        if Config.movement.heavyBoost and ch then pcall(function() ch:SetAttribute("Heavy", true) end) end
+        if Config.movement.walkSpeed.enabled then
+            hum.WalkSpeed = Config.movement.walkSpeed.value
+        elseif Config.autoWeave.enabled and aw.cycleActive and Active and Active.Weaving == true then
+            local okc, ws = pcall(function() return CharacterController:Get("WalkSpeed") end)
+            hum.WalkSpeed = (okc and tonumber(ws)) or 16
+        end
     end
 end)
 
 -- =========================== APPLY ALL =====================================
--- Single entry point used by Load Config, so a load lands everywhere the
--- widget callbacks would have put it.
 
 ApplyAllConfig = function()
-    CounterEnabled = Config.counter.enabled
-    CounterReturn = Config.counter.returnFire
-    CounterClear = Config.counter.clearStun
-    CounterAssert = Config.counter.assert
-
     for _, entry in ipairs(SyncList) do
         local el = Options[entry[1]]
         local v = pathGet(Config, entry[2])
@@ -1351,24 +1423,18 @@ ApplyAllConfig = function()
     end
 
     if Config.autoWeave.enabled then autoWeaveStart() else autoWeaveStop() end
-    if WeaveHitSet then WeaveHitSet(Config.weaveHit.enabled) end
-    if KillAuraSet then KillAuraSet(Config.killaura.enabled) end
     ApplyTransparency(LP.Character)
     RebuildCrosshair()
-    ApplySensitivity()
     HeadlessToggle(Config.headless)
     PhillyToggle(Config.philly)
     LowGraphicsToggle(Config.lowGraphics)
     StretchToggle(Config.stretchResolution)
-    if LP.Character then setupCounterStun(LP.Character) end
     notify("Config applied")
 end
 
 -- =========================== DISCOVERY ====================================
--- The hardcoded module paths were guesses. Scan what the game actually ships,
--- resolve by name, and fall back to the old paths only if the scan misses.
 
-local Discovered = { modules = {}, remotes = {} }
+local Discovered = { modules = {}, remotes = {}, re = {} }
 
 local function scanTree(root, depth)
     if depth <= 0 then return end
@@ -1428,6 +1494,8 @@ local function doctorLines()
     table.sort(remNames)
 
     local L = {}
+    L[#L + 1] = "YSL " .. VERSION
+    L[#L + 1] = string.format("hits=%d blocked_by_rate=%d grey=%d", STATS.hits or 0, STATS.blocked or 0, STATS.greySwept or 0)
     L[#L + 1] = string.format("modules=%d remotes=%d", modCount, remCount)
     L[#L + 1] = string.format("Combat=%s Weave=%s HitReport=%s",
         tostring(Combat ~= nil),
@@ -1438,6 +1506,8 @@ local function doctorLines()
         tostring(CharacterController ~= nil), tostring(DataController ~= nil))
     L[#L + 1] = "remotes: " .. (#remNames > 0 and table.concat(remNames, ", ") or "(none)")
     L[#L + 1] = "modules: " .. (#modNames > 0 and table.concat(modNames, ", ") or "(none)")
+    L[#L + 1] = "PlaceId: " .. tostring(game.PlaceId)
+    L[#L + 1] = "CombatService.RE: " .. (#Discovered.re > 0 and table.concat(Discovered.re, ", ") or "(not found)")
     return L
 end
 
@@ -1447,108 +1517,8 @@ RunDoctor = function()
     if hasFS() then
         ensureFolder("YSL")
         pcall(writefile, "YSL/doctor.txt", table.concat(L, "\n"))
-        print("[YSL] wrote YSL/doctor.txt")
     end
-    notify("Doctor: " .. L[1] .. " | " .. L[2])
-end
-
--- =========================== REMOTE SPY ====================================
--- You cannot enumerate what the server hides, but you can watch the client fire
--- it. Hooking __namecall captures the real instance and its arguments, then
--- binds the two combat remotes by their argument shape.
-
-local spy = { capturing = false, installed = false, seen = {}, hit = nil, weave = nil }
-
-local function spyRecord(inst, ...)
-    local okn, full = pcall(function() return inst:GetFullName() end)
-    if not okn or type(full) ~= "string" then full = tostring(inst.Name) end
-    local args = table.pack(...)
-    local sig, hasPart, hasVec, onlyBool = {}, false, false, (args.n == 1)
-    for i = 1, args.n do
-        local t = typeof(args[i])
-        sig[i] = t
-        if t == "Instance" then
-            local okp, is = pcall(function() return args[i]:IsA("BasePart") end)
-            if okp and is then hasPart = true end
-        elseif t == "Vector3" then
-            hasVec = true
-        elseif t ~= "boolean" then
-            onlyBool = false
-        end
-    end
-    local key = full .. "|n" .. args.n
-    if not spy.seen[key] then
-        spy.seen[key] = true
-        local line = string.format("%s [%s] n=%d (%s)", full, inst.ClassName, args.n, table.concat(sig, ","))
-        spyLog[#spyLog + 1] = line
-        print("[YSL spy] " .. line)
-    end
-    if inst:IsA("RemoteEvent") then
-        if hasPart and hasVec and not spy.hit then
-            spy.hit = inst
-            learnedHitArgs = args
-        end
-        if onlyBool and not spy.weave then spy.weave = inst end
-    end
-end
-
-StartSpy = function(seconds)
-    seconds = tonumber(seconds) or 10
-    if not spy.installed then
-        if hookmetamethod and getnamecallmethod and newcclosure then
-            local okh, err = pcall(function()
-                local old
-                old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-                    if spy.capturing then
-                        local m = getnamecallmethod()
-                        if (m == "FireServer" or m == "InvokeServer") and typeof(self) == "Instance" then
-                            pcall(spyRecord, self, ...)
-                        end
-                    end
-                    return old(self, ...)
-                end))
-            end)
-            if okh then
-                spy.installed = true
-                print("[YSL] spy hook installed")
-            else
-                warn("[YSL] spy hook failed: " .. tostring(err))
-            end
-        else
-            warn("[YSL] hookmetamethod unavailable - using keyword match only")
-        end
-    end
-    spy.capturing = true
-    notify(string.format("Capturing %ds - punch someone now", seconds))
-    task.delay(seconds, function()
-        spy.capturing = false
-        if spy.hit then
-            Combat = Combat or {}
-            Combat.HitReport = spy.hit
-            print("[YSL] learned HitReport -> " .. spy.hit:GetFullName())
-        end
-        if spy.weave then
-            Combat = Combat or {}
-            Combat.Weave = spy.weave
-            print("[YSL] learned Weave -> " .. spy.weave:GetFullName())
-        end
-        notify(string.format("Capture done: %d unique calls", #spyLog))
-    end)
-end
-
-DumpSpy = function()
-    if #spyLog == 0 then
-        notify("Spy log empty - run a capture first")
-        return
-    end
-    for _, l in ipairs(spyLog) do print("[YSL spy] " .. l) end
-    if hasFS() then
-        ensureFolder("YSL")
-        local ok = pcall(writefile, "YSL/spy.txt", table.concat(spyLog, "\n"))
-        notify(ok and "Wrote YSL/spy.txt" or "Write failed")
-    else
-        notify(#spyLog .. " calls - see console")
-    end
+    notify("Doctor " .. VERSION .. ": " .. L[2] .. " | " .. L[3])
 end
 
 -- =========================== INIT ==========================================
@@ -1556,8 +1526,6 @@ end
 task.spawn(function()
     task.wait(1.5)
     local ok, err = pcall(function()
-        -- Sweep anything an earlier version of this script left behind: stray
-        -- marker parts (the grey box), stale glide bodies, duplicate crosshairs.
         local function sweep(parent)
             for _, inst in ipairs(parent:GetChildren()) do
                 local n = inst.Name
@@ -1572,12 +1540,12 @@ task.spawn(function()
         local pg = LP:FindFirstChild("PlayerGui")
         if pg then
             for _, inst in ipairs(pg:GetChildren()) do
-                if inst.Name == "YSL_Cross" then pcall(function() inst:Destroy() end) end
+                if inst.Name == "YSL_Cross" or inst.Name == "YSL_DIAG" then
+                    pcall(function() inst:Destroy() end)
+                end
             end
         end
 
-        -- Every remote the client can fire must exist in the replicated tree,
-        -- so getDescendants on game sees all of them. No guessing by folder.
         local okAll, all = pcall(function() return game:GetDescendants() end)
         if okAll and type(all) == "table" then
             for _, inst in ipairs(all) do
@@ -1590,14 +1558,34 @@ task.spawn(function()
         else
             scanTree(ReplicatedStorage, 8)
         end
-        print(string.format("[YSL] discovered %d modules, %d remotes",
-            (function() local n = 0 for _ in pairs(Discovered.modules) do n = n + 1 end return n end)(),
-            (function() local n = 0 for _ in pairs(Discovered.remotes) do n = n + 1 end return n end)()))
 
         Remotes = resolveModule("Remotes", { "Shared", "Net", "Remotes" }, 2)
+        local wrapperResolved = false
         if Remotes and Remotes.Client then
             local okc, c = pcall(function() return Remotes.Client("CombatService") end)
-            if okc then Combat = c end
+            if okc and type(c) == "table" then
+                Combat = c
+                wrapperResolved = true
+            end
+        end
+
+        local RE = nil
+        do
+            local ok, v = pcall(function()
+                local r = ReplicatedStorage:FindFirstChild("Remotes")
+                local cs = r and r:FindFirstChild("CombatService")
+                return cs and cs:FindFirstChild("RE")
+            end)
+            if ok and v then RE = v end
+        end
+        if RE then
+            for _, ch in ipairs(RE:GetChildren()) do
+                Discovered.re[#Discovered.re + 1] = ch.Name
+                if ch:IsA("RemoteEvent") or ch:IsA("RemoteFunction") then
+                    Discovered.remotes[ch.Name] = ch
+                end
+            end
+            table.sort(Discovered.re)
         end
         AttackState         = resolveModule("AttackState", { "Client", "Combat", "AttackState" }, 2)
         HitWindow           = resolveModule("HitWindow", { "Client", "Combat", "HitWindow" }, 2)
@@ -1606,15 +1594,49 @@ task.spawn(function()
         DataController      = resolveModule("DataController", { "Client", "Controllers", "DataController" }, 2)
         Classes             = resolveModule("Classes", { "Shared", "Config", "Classes" }, 1.5)
 
-        -- If the service table never resolved, wire straight to the real remotes.
         if not Combat then Combat = {} end
-        if not Combat.Weave then
-            local r = remoteLike({ "weave", "weaving" })
-            if r then Combat.Weave = r; print("[YSL] Weave -> " .. r.Name) end
+
+        local function reChild(want)
+            if not RE then return nil end
+            local w = string.lower(want)
+            for _, ch in ipairs(RE:GetChildren()) do
+                if string.lower(ch.Name) == w then return ch end
+            end
+            return nil
         end
+
+        if wrapperResolved then
+            Combat.HitReport   = Combat.HitReport or Combat.Hitreport or Combat.hitreport
+                or Combat.Hit or Combat.hit or Combat.Attack or Combat.attack
+                or Combat.Damage or Combat.damage or Combat.HitBox or Combat.Hitbox
+            Combat.Weave       = Combat.Weave or Combat.weave
+            Combat.Swing       = Combat.Swing or Combat.swing
+            Combat.HitRejected = Combat.HitRejected or Combat.Hitrejected
+            Combat.Cooldown    = Combat.Cooldown or Combat.cooldown
+        else
+            Combat.HitReport = reChild("hitreport")
+            Combat.Weave     = nil
+        end
+
         if not Combat.HitReport then
-            local r = remoteLike({ "hitreport", "hit", "damage", "strike", "swing", "punch", "attack", "combat" })
-            if r then Combat.HitReport = r; print("[YSL] HitReport -> " .. r.Name) end
+            local r = remoteLike({ "hitreport", "hit", "damage", "strike" })
+            if r then Combat.HitReport = r end
+        end
+
+        if Combat.HitRejected and Combat.HitRejected.OnClientEvent then
+            pcall(function()
+                Combat.HitRejected.OnClientEvent:Connect(function(...)
+                    local a = table.pack(...)
+                    local bits = {}
+                    for i = 1, math.min(a.n, 5) do bits[i] = brief(a[i]) end
+                    local msg = table.concat(bits, " | ")
+                    print("[YSL] HIT REJECTED: " .. msg)
+                    if os.clock() - lastRejectAt > 2 then
+                        lastRejectAt = os.clock()
+                        notify("Rejected: " .. string.sub(msg, 1, 70))
+                    end
+                end)
+            end)
         end
 
         if AttackState and AttackState.Active then Active = AttackState.Active end
@@ -1631,7 +1653,6 @@ task.spawn(function()
                 end
                 return origHitReportFire(self, seq, root, pos, ...)
             end)
-            print("[YSL] HitReport hooked")
         end
 
         hookCombat()
@@ -1644,13 +1665,33 @@ task.spawn(function()
                     attackTrigger()
                 end
             end)
-            print("[YSL] no HitWindow path - input fallback active for hits")
         end
 
         if LP.Character then
-            setupCounterStun(LP.Character)
             ApplyTransparency(LP.Character)
             if Config.headless then applyHeadless(LP.Character) end
+        end
+
+        if ENABLE_SWEEP then
+            sweepDebugVisuals(true)
+            task.spawn(function()
+                while true do
+                    sweepDebugVisuals()
+                    task.wait(3)
+                end
+            end)
+        end
+
+        local function attachKill(inst)
+            if killWeaveHighlight(inst) then return end
+            if inst:IsA("BasePart") and inst.Parent and inst.Parent:IsA("Attachment")
+                and visualizerName(inst.Name) then
+                pcall(function() inst:Destroy() end)
+                STATS.greySwept = (STATS.greySwept or 0) + 1
+            end
+        end
+        if LP.Character then
+            pcall(function() LP.Character.DescendantAdded:Connect(attachKill) end)
         end
 
         LP.CharacterAdded:Connect(function(ch)
@@ -1658,18 +1699,23 @@ task.spawn(function()
             stopGlide()
             transOriginal = setmetatable({}, { __mode = "k" })
             watchedChar = nil
-            counterSetupChar = nil
-            if counterConn then pcall(function() counterConn:Disconnect() end); counterConn = nil end
-            setupCounterStun(ch)
-            if Config.headless then applyHeadless(ch) end
-            if Config.philly then PhillyToggle(true) end
             ApplyTransparency(ch)
             if Config.crosshair.enabled then RebuildCrosshair() end
-            ApplySensitivity()
+            if Config.headless then
+                task.delay(0.33, function()
+                    if LP.Character == ch then applyHeadless(ch) end
+                end)
+            end
+            if Config.philly then PhillyToggle(true) end
+            if Config.lowGraphics then LowGraphicsToggle(true) end
+            if Config.stretchResolution then StretchToggle(true) end
+            if ENABLE_SWEEP then sweepDebugVisuals(true) end
+            pcall(function() ch.DescendantAdded:Connect(attachKill) end)
+            keepGuiAlive()
         end)
 
-        print("[YSL] Combat ready")
-        RunDoctor()
+        keepGuiAlive()
+        print("[YSL] " .. VERSION .. " Combat ready")
 
         task.wait(1)
         local autoName = nil
@@ -1678,22 +1724,25 @@ task.spawn(function()
             if rok then autoName = sanitizeName(body) end
         end
         if autoName then
-            local data, lerr = readConfig(autoName)
+            local data = readConfig(autoName)
             if data then
                 deepApply(Config, data)
                 ApplyAllConfig()
-                print("[YSL] autoloaded: " .. autoName)
-            else
-                warn("[YSL] autoload failed: " .. tostring(lerr))
+                Config.autoWeave.enabled = false
+                if autoWeaveStop then autoWeaveStop() end
+                if Options.aw_enabled and Options.aw_enabled.SetValue then
+                    pcall(function() Options.aw_enabled:SetValue(false) end)
+                end
+                notify("Loaded " .. autoName .. " - features start on toggle")
             end
         end
     end)
-    if not ok then warn("[YSL] init: " .. tostring(err)) end
+    if not ok then showError("init: " .. tostring(err)) end
 end)
 
 syncBudgets()
 
 end) -- feature pcall
 
-if not featureOk then warn("[YSL] FEATURE ERROR: " .. tostring(featureErr)) end
+if not featureOk then showError("FEATURE ERROR: " .. tostring(featureErr)) end
 print("[YSL] ready")
